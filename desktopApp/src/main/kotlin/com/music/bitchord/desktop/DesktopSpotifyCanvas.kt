@@ -13,6 +13,7 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
 import java.io.ByteArrayOutputStream
+import java.net.CookieHandler
 import java.net.URI
 import java.net.URLEncoder
 import java.net.http.HttpClient
@@ -22,6 +23,13 @@ import java.nio.charset.StandardCharsets
 import java.time.Duration
 import java.util.Base64
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import javafx.animation.KeyFrame
+import javafx.animation.Timeline
+import javafx.application.Platform
+import javafx.event.EventHandler
+import javafx.scene.web.WebView
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
@@ -344,10 +352,37 @@ internal object DesktopSpotifyToken {
     fun cookie(): String = DesktopPersistence().string(KEY_SPDC).trim()
 
     fun setCookie(value: String) {
-        DesktopPersistence().saveString(KEY_SPDC, value.trim())
-        cachedAccessToken = null
-        accessTokenExpiresAtMs = 0L
+        val trimmed = value.trim()
+        val current = cookie()
+        val shouldClear = trimmed.isBlank() || trimmed != current
+        DesktopPersistence().saveString(KEY_SPDC, trimmed)
+        if (shouldClear) {
+            cachedAccessToken = null
+            accessTokenExpiresAtMs = 0L
+            cachedClientId = null
+            retryAfterMs = 0L
+            val persistence = DesktopPersistence()
+            persistence.saveString(KEY_ACCESS_TOKEN, "")
+            persistence.saveString(KEY_TOKEN_EXP, "0")
+            persistence.saveString(KEY_CLIENT_ID, "")
+        }
+    }
+
+    fun setWebSession(accessToken: String, expiresAtMs: Long, clientId: String?) {
+        val token = accessToken.trim()
+        if (token.isBlank()) return
+        val exp = expiresAtMs.takeIf { it > 0L } ?: (System.currentTimeMillis() + 3_600_000L)
+        cachedAccessToken = token
+        accessTokenExpiresAtMs = exp
+        if (!clientId.isNullOrBlank()) cachedClientId = clientId.trim()
         retryAfterMs = 0L
+
+        val persistence = DesktopPersistence()
+        persistence.saveString(KEY_ACCESS_TOKEN, token)
+        persistence.saveString(KEY_TOKEN_EXP, exp.toString())
+        if (!clientId.isNullOrBlank()) {
+            persistence.saveString(KEY_CLIENT_ID, clientId.trim())
+        }
     }
 
     @Synchronized
@@ -355,7 +390,26 @@ internal object DesktopSpotifyToken {
         val cookie = cookie().ifBlank { return null }
         val now = System.currentTimeMillis()
         cachedAccessToken?.let { if (now < accessTokenExpiresAtMs - 30_000) return it }
+
+        val persistence = DesktopPersistence()
+        val persistedToken = persistence.string(KEY_ACCESS_TOKEN).trim()
+        val persistedExp = persistence.string(KEY_TOKEN_EXP).toLongOrNull() ?: 0L
+        if (persistedToken.isNotBlank() && now < persistedExp - 30_000) {
+            cachedAccessToken = persistedToken
+            accessTokenExpiresAtMs = persistedExp
+            val persistedClientId = persistence.string(KEY_CLIENT_ID).trim().ifBlank { null }
+            if (persistedClientId != null) {
+                cachedClientId = persistedClientId
+            }
+            return persistedToken
+        }
+
         if (now < retryAfterMs) return null
+
+        if (DesktopPoTokenWebView.available) {
+            val harvested = harvestViaWebView(cookie)
+            if (harvested != null) return harvested
+        }
 
         val secret = TOTP_SECRETS.maxByOrNull { it.key }
         val code = secret?.let { totp(it.value, now / 1000) }
@@ -386,11 +440,148 @@ internal object DesktopSpotifyToken {
             DesktopTrackLog.log("canvas: Spotify would not mint an access token")
             return null
         }
-        cachedAccessToken = token
-        accessTokenExpiresAtMs = root["accessTokenExpirationTimestampMs"]
+        val exp = root["accessTokenExpirationTimestampMs"]
             ?.jsonPrimitive?.contentOrNull?.toLongOrNull() ?: (now + 3_600_000)
-        cachedClientId = root["clientId"]?.jsonPrimitive?.contentOrNull
+        val clientId = root["clientId"]?.jsonPrimitive?.contentOrNull
+        setWebSession(token, exp, clientId)
         return token
+    }
+
+    private fun harvestViaWebView(cookie: String): String? {
+        if (Platform.isFxApplicationThread()) {
+            return null
+        }
+        val latch = CountDownLatch(1)
+        var harvestedToken: String? = null
+        var harvestedExp = 0L
+        var harvestedClientId: String? = null
+        var harvestedClientToken: String? = null
+
+        val runHarvest = Runnable {
+            DesktopWebCookies.install()
+            val headers = mapOf("Set-Cookie" to listOf("sp_dc=$cookie; Domain=.spotify.com; Path=/; Secure"))
+            runCatching {
+                CookieHandler.getDefault().put(URI("https://open.spotify.com/"), headers)
+                CookieHandler.getDefault().put(URI("https://accounts.spotify.com/"), headers)
+            }
+
+            val webView = WebView()
+            val engine = webView.engine
+            engine.userAgent = CANVAS_UA
+
+            val hookScript = """
+                (function() {
+                    if (window.__bitchordHarvestHook) return;
+                    window.__bitchordHarvestHook = true;
+                    window.__bitchordBearer = null;
+                    window.__bitchordClientToken = null;
+
+                    function inspectAuth(auth) {
+                        if (auth && typeof auth === 'string' && auth.indexOf('Bearer ') === 0) {
+                            window.__bitchordBearer = auth.substring(7).trim();
+                        }
+                    }
+
+                    var origFetch = window.fetch;
+                    if (origFetch) {
+                        window.fetch = function(url, init) {
+                            var u = String((url && url.url) ? url.url : url);
+                            if (init && init.headers) {
+                                if (typeof init.headers.get === 'function') {
+                                    inspectAuth(init.headers.get('Authorization') || init.headers.get('authorization'));
+                                } else if (init.headers['Authorization']) {
+                                    inspectAuth(init.headers['Authorization']);
+                                } else if (init.headers['authorization']) {
+                                    inspectAuth(init.headers['authorization']);
+                                }
+                            }
+                            var res = origFetch.apply(this, arguments);
+                            if (u.indexOf('/api/token') !== -1 || u.indexOf('clienttoken') !== -1) {
+                                try {
+                                    res.then(function(r) {
+                                        r.clone().text().then(function(t) {
+                                            if (u.indexOf('/api/token') !== -1 && t.indexOf('accessToken') !== -1) {
+                                                try {
+                                                    var parsed = JSON.parse(t);
+                                                    if (parsed && parsed.accessToken && !parsed.isAnonymous) {
+                                                        window.__bitchordBearer = parsed.accessToken;
+                                                    }
+                                                } catch(e) {}
+                                            } else if (u.indexOf('clienttoken') !== -1 && t.indexOf('granted_token') !== -1) {
+                                                try {
+                                                    var cp = JSON.parse(t);
+                                                    if (cp && cp.granted_token && cp.granted_token.token) {
+                                                        window.__bitchordClientToken = cp.granted_token.token;
+                                                    }
+                                                } catch(e) {}
+                                            }
+                                        }).catch(function(){});
+                                    }).catch(function(){});
+                                } catch(e) {}
+                            }
+                            return res;
+                        };
+                    }
+                })()
+            """.trimIndent()
+
+            fun tryInject() {
+                runCatching { engine.executeScript(hookScript) }
+            }
+
+            engine.locationProperty().addListener { _, _, _ -> tryInject() }
+            engine.documentProperty().addListener { _, _, _ -> tryInject() }
+            engine.loadWorker.stateProperty().addListener { _, _, _ -> tryInject() }
+
+            var pollTimeline: Timeline? = null
+            var count = 0
+            val maxPolls = 35
+            pollTimeline = Timeline(
+                KeyFrame(
+                    javafx.util.Duration.millis(200.0),
+                    EventHandler {
+                        count++
+                        tryInject()
+                        val bearer = runCatching {
+                            engine.executeScript("window.__bitchordBearer") as? String
+                        }.getOrNull()?.trim()?.takeIf(String::isNotBlank)
+
+                        val clientTok = runCatching {
+                            engine.executeScript("window.__bitchordClientToken") as? String
+                        }.getOrNull()?.trim()?.takeIf(String::isNotBlank)
+
+                        if (!bearer.isNullOrBlank() || count >= maxPolls) {
+                            pollTimeline?.stop()
+                            if (!bearer.isNullOrBlank()) {
+                                harvestedToken = bearer
+                                harvestedExp = System.currentTimeMillis() + 3_600_000L
+                                harvestedClientToken = clientTok
+                            }
+                            runCatching { engine.load("about:blank") }
+                            latch.countDown()
+                        }
+                    }
+                )
+            )
+            pollTimeline.cycleCount = maxPolls
+            pollTimeline.play()
+
+            engine.load("https://open.spotify.com/")
+        }
+
+        Platform.runLater(runHarvest)
+        val completed = runCatching { latch.await(10, TimeUnit.SECONDS) }.getOrDefault(false)
+        if (completed && !harvestedToken.isNullOrBlank()) {
+            val token = harvestedToken!!
+            DesktopTrackLog.log("canvas: successfully harvested live bearer token via offscreen WebView")
+            setWebSession(token, harvestedExp, harvestedClientId)
+            if (!harvestedClientToken.isNullOrBlank()) {
+                cachedClientToken = harvestedClientToken
+                clientTokenExpiresAtMs = System.currentTimeMillis() + 3_600_000L
+            }
+            return token
+        }
+        return null
     }
 
     /**
@@ -401,7 +592,9 @@ internal object DesktopSpotifyToken {
     fun clientToken(): String? {
         val now = System.currentTimeMillis()
         cachedClientToken?.let { if (now < clientTokenExpiresAtMs - 30_000) return it }
-        val clientId = cachedClientId ?: return null
+        val clientId = cachedClientId
+            ?: DesktopPersistence().string(KEY_CLIENT_ID).trim().ifBlank { null }
+            ?: return null
         val (clientVersion, deviceId) = session() ?: return null
 
         val payload = buildJsonObject {
@@ -492,4 +685,7 @@ internal object DesktopSpotifyToken {
     private const val RETRY_MS = 30L * 60 * 1000
 
     internal const val KEY_SPDC = "spotify_spdc_token"
+    internal const val KEY_ACCESS_TOKEN = "spotify_access_token"
+    internal const val KEY_TOKEN_EXP = "spotify_token_exp"
+    internal const val KEY_CLIENT_ID = "spotify_client_id"
 }

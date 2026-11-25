@@ -4,8 +4,11 @@ import java.net.CookieHandler
 import java.net.URI
 import java.nio.file.Files
 import java.nio.file.Path
+import javafx.animation.KeyFrame
+import javafx.animation.Timeline
 import javafx.application.Platform
 import javafx.concurrent.Worker
+import javafx.event.EventHandler
 import javafx.geometry.Insets
 import javafx.scene.Scene
 import javafx.scene.control.Button
@@ -16,8 +19,13 @@ import javafx.scene.layout.Priority
 import javafx.scene.layout.Region
 import javafx.scene.web.WebView
 import javafx.stage.Stage
+import javafx.util.Duration
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 
 /**
  * In-app sign-in, as Android does it: the provider's own web login in a WebView, and the session read
@@ -69,6 +77,127 @@ internal object DesktopWebSignIn {
 
     private const val SPOTIFY_COOKIE = "sp_dc"
 
+    private val json = Json { ignoreUnknownKeys = true; isLenient = true }
+
+    private val SPOTIFY_HOOK_SCRIPT = """
+        (function () {
+          if (window.__bitchordTokenHook) return;
+          window.__bitchordTokenHook = true;
+          window.__bitchordTokenPayload = '';
+          window.__bitchordBearer = '';
+          window.__bitchordClientToken = '';
+
+          function inspectAuth(auth) {
+            if (auth && typeof auth === 'string' && auth.indexOf('Bearer ') === 0) {
+              window.__bitchordBearer = auth.substring(7).trim();
+            }
+          }
+
+          function report(body) {
+            try {
+              if (body && typeof body === 'string') {
+                if (body.indexOf('accessToken') !== -1) {
+                  window.__bitchordTokenPayload = body;
+                } else if (body.indexOf('granted_token') !== -1) {
+                  try {
+                    var cp = JSON.parse(body);
+                    if (cp && cp.granted_token && cp.granted_token.token) {
+                      window.__bitchordClientToken = cp.granted_token.token;
+                    }
+                  } catch(e) {}
+                }
+              }
+            } catch (e) {}
+          }
+
+          var origFetch = window.fetch;
+          if (origFetch) {
+            window.fetch = function (input, init) {
+              var url = (input && input.url) ? input.url : input;
+              if (init && init.headers) {
+                if (typeof init.headers.get === 'function') {
+                  inspectAuth(init.headers.get('Authorization') || init.headers.get('authorization'));
+                } else if (init.headers['Authorization']) {
+                  inspectAuth(init.headers['Authorization']);
+                } else if (init.headers['authorization']) {
+                  inspectAuth(init.headers['authorization']);
+                }
+              }
+              var result = origFetch.apply(this, arguments);
+              var u = String(url);
+              if (u.indexOf('/api/token') !== -1 || u.indexOf('clienttoken') !== -1) {
+                try {
+                  result.then(function (res) {
+                    res.clone().text().then(report).catch(function () {});
+                  }).catch(function () {});
+                } catch (e) {}
+              }
+              return result;
+            };
+          }
+
+          var origOpen = XMLHttpRequest.prototype.open;
+          if (origOpen) {
+            XMLHttpRequest.prototype.open = function (method, url) {
+              this.__bitchordUrl = url;
+              return origOpen.apply(this, arguments);
+            };
+          }
+          var origSend = XMLHttpRequest.prototype.send;
+          if (origSend) {
+            XMLHttpRequest.prototype.send = function () {
+              var xhr = this;
+              try {
+                xhr.addEventListener('load', function () {
+                  var u = String(xhr.__bitchordUrl);
+                  if (u.indexOf('/api/token') !== -1 || u.indexOf('clienttoken') !== -1) {
+                    try { report(xhr.responseText); } catch (e) {}
+                  }
+                });
+              } catch (e) {}
+              return origSend.apply(this, arguments);
+            };
+          }
+        })();
+    """.trimIndent()
+
+    private val SPOTIFY_EXTRACT_SCRIPT = """
+        (function() {
+          if (window.__bitchordBearer && typeof window.__bitchordBearer === 'string') {
+            return JSON.stringify({ accessToken: window.__bitchordBearer, isAnonymous: false });
+          }
+          if (window.__bitchordTokenPayload && typeof window.__bitchordTokenPayload === 'string') {
+            return window.__bitchordTokenPayload;
+          }
+          var el = document.getElementById('session');
+          if (el && el.textContent) {
+            return el.textContent;
+          }
+          for (var i = 0; i < localStorage.length; i++) {
+            var v = localStorage.getItem(localStorage.key(i));
+            if (v && v.indexOf('accessToken') !== -1) return v;
+          }
+          return '';
+        })()
+    """.trimIndent()
+
+    private data class SpotifyTokenSession(
+        val accessToken: String,
+        val expiresAtMs: Long,
+        val clientId: String?,
+        val isAnonymous: Boolean,
+    )
+
+    private fun parseSpotifyToken(raw: String): SpotifyTokenSession? = runCatching {
+        if (raw.isBlank() || !raw.contains("accessToken")) return null
+        val root = json.parseToJsonElement(raw.trim()).jsonObject
+        val token = root["accessToken"]?.jsonPrimitive?.contentOrNull?.takeIf(String::isNotBlank) ?: return null
+        val anonymous = root["isAnonymous"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull() ?: false
+        val expiresAt = root["accessTokenExpirationTimestampMs"]?.jsonPrimitive?.contentOrNull?.toLongOrNull() ?: 0L
+        val clientId = root["clientId"]?.jsonPrimitive?.contentOrNull
+        SpotifyTokenSession(token, expiresAt, clientId, anonymous)
+    }.getOrNull()
+
     /** The cookies [service] would send, as a `Cookie` header value. */
     private fun cookies(service: Service): String = runCatching {
         CookieHandler.getDefault().get(URI(service.cookieUrl), emptyMap())["Cookie"].orEmpty().joinToString("; ")
@@ -95,6 +224,7 @@ internal object DesktopWebSignIn {
         private val where = Label().apply { style = "-fx-text-fill: #aaaaaa;" }
         private var view: WebView? = null
         private var storage: Path? = null
+        private var pollTimeline: Timeline? = null
         private var done = false
 
         init {
@@ -131,30 +261,113 @@ internal object DesktopWebSignIn {
             val next = WebView().also { view = it }
             val engine = next.engine
             engine.userDataDirectory = folder.toFile()
-            engine.locationProperty().addListener { _, _, url -> where.text = hostOf(url) }
+            engine.userAgent = CANVAS_UA
+            engine.locationProperty().addListener { _, _, url ->
+                where.text = hostOf(url)
+                if (url.orEmpty().startsWith("https://open.spotify.com")) {
+                    injectSpotifyHook(next)
+                    onPage(next, url.orEmpty())
+                }
+            }
+            engine.documentProperty().addListener { _, _, _ ->
+                val url = engine.location.orEmpty()
+                if (url.startsWith("https://open.spotify.com")) {
+                    injectSpotifyHook(next)
+                    onPage(next, url)
+                }
+            }
             engine.loadWorker.stateProperty().addListener { _, _, state ->
-                if (state == Worker.State.SUCCEEDED && view === next) onPage(engine.location.orEmpty())
+                val url = engine.location.orEmpty()
+                if (url.startsWith("https://open.spotify.com")) {
+                    injectSpotifyHook(next)
+                }
+                if (state == Worker.State.SUCCEEDED && view === next) {
+                    onPage(next, engine.location.orEmpty())
+                }
             }
             confirm.isDisable = true
             root.center = next
             engine.load(service.startUrl)
         }
 
-        private fun onPage(url: String) {
+        private fun injectSpotifyHook(webView: WebView) {
+            if (service != Service.SPOTIFY) return
+            runCatching { webView.engine.executeScript(SPOTIFY_HOOK_SCRIPT) }
+        }
+
+        private fun onPage(webView: WebView, url: String) {
             when (service) {
                 // Reaching YouTube Music only enables confirming: a multi-channel login may still be
                 // choosing its identity on this page.
                 Service.YOUTUBE_MUSIC ->
                     confirm.isDisable = !url.startsWith("https://music.youtube.com") || youtubeSession() == null
                 Service.SPOTIFY -> if (url.startsWith("https://open.spotify.com")) {
-                    spotifySession()?.let { complete(Result.success(it)) }
+                    val cookie = spotifySession() ?: return
+                    injectSpotifyHook(webView)
+                    startSpotifyTokenPolling(webView, cookie)
                 }
             }
+        }
+
+        private fun startSpotifyTokenPolling(webView: WebView, cookie: String) {
+            pollTimeline?.stop()
+            pollTimeline = null
+
+            fun tryExtract(): Boolean {
+                if (done) return true
+                val payload = runCatching {
+                    webView.engine.executeScript(SPOTIFY_EXTRACT_SCRIPT) as? String
+                }.getOrNull().orEmpty()
+
+                val session = parseSpotifyToken(payload)
+                if (session != null && !session.isAnonymous) {
+                    DesktopTrackLog.log("sign-in: Spotify access token captured from web session")
+                    DesktopSpotifyToken.setCookie(cookie)
+                    DesktopSpotifyToken.setWebSession(session.accessToken, session.expiresAtMs, session.clientId)
+                    complete(Result.success(cookie))
+                    return true
+                }
+                return false
+            }
+
+            if (tryExtract()) return
+
+            var pollCount = 0
+            val maxPolls = 30 // 30 * 200ms = 6s
+            val timeline = Timeline(
+                KeyFrame(
+                    Duration.millis(200.0),
+                    EventHandler {
+                        if (done) {
+                            pollTimeline?.stop()
+                            pollTimeline = null
+                            return@EventHandler
+                        }
+                        pollCount++
+                        injectSpotifyHook(webView)
+                        val captured = tryExtract()
+                        if (captured || pollCount >= maxPolls) {
+                            pollTimeline?.stop()
+                            pollTimeline = null
+                            if (!captured) {
+                                DesktopTrackLog.log("sign-in: Spotify access token not captured within polling window; saving cookie")
+                                DesktopSpotifyToken.setCookie(cookie)
+                                complete(Result.success(cookie))
+                            }
+                        }
+                    },
+                ),
+            )
+            timeline.cycleCount = maxPolls
+            pollTimeline = timeline
+            timeline.play()
         }
 
         private fun complete(result: Result<String>) {
             if (done) return
             done = true
+            pollTimeline?.stop()
+            pollTimeline = null
             if (result.isSuccess) DesktopTrackLog.log("sign-in: ${service.name} session captured in the sign-in window")
             stage.close()
             discard()
@@ -167,6 +380,8 @@ internal object DesktopWebSignIn {
 
         /** Stops the current page and deletes its storage. */
         private fun discard() {
+            pollTimeline?.stop()
+            pollTimeline = null
             view?.engine?.load("about:blank")
             view = null
             storage?.toFile()?.let { folder ->

@@ -145,6 +145,25 @@ class DesktopCanvasTest {
     private fun nested(number: Int, payload: ByteArray): ByteArray =
         byteArrayOf((number shl 3 or 2).toByte()) + varint(payload.size) + payload
 
+    @Test
+    fun `DesktopSpotifyToken preserves web session when same cookie is re-applied`() {
+        DesktopSpotifyToken.setCookie("test_sp_dc_cookie")
+        val exp = System.currentTimeMillis() + 3_600_000L
+        DesktopSpotifyToken.setWebSession("test_token_123", exp, "client_id_abc")
+
+        assertEquals("test_token_123", DesktopSpotifyToken.accessToken())
+        assertEquals("client_id_abc", DesktopPersistence().string(DesktopSpotifyToken.KEY_CLIENT_ID))
+
+        // Applying the same cookie must NOT wipe the cached or persisted token
+        DesktopSpotifyToken.setCookie("test_sp_dc_cookie")
+        assertEquals("test_token_123", DesktopSpotifyToken.accessToken())
+
+        // Clearing the cookie MUST clear the token
+        DesktopSpotifyToken.setCookie("")
+        assertNull(DesktopSpotifyToken.accessToken())
+        assertEquals("", DesktopPersistence().string(DesktopSpotifyToken.KEY_ACCESS_TOKEN))
+    }
+
     private fun varint(value: Int): ByteArray {
         var remaining = value
         val out = mutableListOf<Byte>()
